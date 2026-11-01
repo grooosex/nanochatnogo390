@@ -1,0 +1,1442 @@
+import { create } from "zustand";
+import {
+  DEFAULT_GROK,
+  DEFAULT_STATUS_BAR,
+  isLegacyStatusBar,
+  defaultImageParams,
+  defaultPureParams,
+  emptyCharacter,
+  migrateGrokId,
+  normalizePureParams,
+} from "./constants";
+import { db, defaultSettings, deleteImage, loadAll, putImage, rememberUrl } from "./idb";
+import { cloneChat } from "./archive";
+import { isWorkshopChat } from "./workshop";
+import { syncCharsFromRole } from "./nai";
+import { forgetIfPrompt, syncAppearanceModule } from "./random-prompt";
+import type {
+  AppearancePreset,
+  Character,
+  CharacterCard,
+  Chat,
+  FavoriteItem,
+  FavGroup,
+  Folder,
+  GrokModelId,
+  HistoryItem,
+  ImageParams,
+  Settings,
+  TabId,
+  UserShot,
+  WechatSession,
+  WechatSticker,
+} from "./types";
+import { dropBuiltinImageModel } from "./image-ai";
+import { normalizeChatMemory } from "./chat-memory";
+import { uid, sortHistoryNewestFirst } from "./utils";
+import { migrateFavorite, presetNameFrom } from "./presets";
+import { settleStuckImages } from "./image-status";
+import { bindSysApp } from "./sys-prompt";
+
+function sortFavorites(items: FavoriteItem[]) {
+  return [...items].sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || (b.createdAt || 0) - (a.createdAt || 0));
+}
+
+function orderFavorites(items: FavoriteItem[]) {
+  if (!items.length) return [];
+  if (items.every((f) => typeof f.order === "number")) return sortFavorites(items);
+  const next = sortHistoryNewestFirst(items).map((f, i) => ({ ...f, order: i }));
+  for (const f of next) void db.favorites.put(f);
+  return next;
+}
+
+export function favGroupDescendants(groups: FavGroup[], id: string) {
+  const out = new Set<string>();
+  const walk = (pid: string) => {
+    for (const g of groups) {
+      if (g.parentId === pid && !out.has(g.id)) {
+        out.add(g.id);
+        walk(g.id);
+      }
+    }
+  };
+  walk(id);
+  return out;
+}
+
+export function countFavsInGroup(groups: FavGroup[], favs: FavoriteItem[], id: string): number {
+  let n = favs.filter((f) => f.groupId === id).length;
+  for (const g of groups) if (g.parentId === id) n += countFavsInGroup(groups, favs, g.id);
+  return n;
+}
+
+function tidyFavTree(groups: FavGroup[], favs: FavoriteItem[]) {
+  const byId = new Map(groups.map((g) => [g.id, g]));
+  const cleanGroups = groups.map((g) => {
+    let parentId = g.parentId && byId.has(g.parentId) && g.parentId !== g.id ? g.parentId : null;
+    const seen = new Set<string>([g.id]);
+    let p = parentId;
+    while (p) {
+      if (seen.has(p) || !byId.has(p)) {
+        parentId = null;
+        break;
+      }
+      seen.add(p);
+      p = byId.get(p)?.parentId ?? null;
+    }
+    return {
+      ...g,
+      name: g.name || "未命名",
+      parentId,
+      collapsed: g.collapsed !== false,
+      order: typeof g.order === "number" ? g.order : 0,
+      starred: g.starred === true,
+    };
+  });
+  const ids = new Set(cleanGroups.map((g) => g.id));
+  return {
+    favGroups: cleanGroups,
+    favorites: favs.map((f) => ({ ...f, groupId: f.groupId && ids.has(f.groupId) ? f.groupId : null })),
+  };
+}
+
+function openFavAncestors(groups: FavGroup[], id: string | null) {
+  if (!id) return groups;
+  const byId = new Map(groups.map((g) => [g.id, g]));
+  const open = new Set<string>();
+  let p: string | null = id;
+  while (p) {
+    open.add(p);
+    p = byId.get(p)?.parentId ?? null;
+  }
+  return groups.map((g) => (open.has(g.id) ? { ...g, collapsed: false } : g));
+}
+
+function copyRoleBody(dst: Character, src: Character): Character {
+  return {
+    ...dst,
+    persona: src.persona,
+    speech: src.speech,
+    appearance: src.appearance,
+    lookBlobId: src.lookBlobId,
+    wechatAvatarBlobId: src.wechatAvatarBlobId,
+    personaVoices: src.personaVoices ?? dst.personaVoices,
+    extras: src.extras ?? dst.extras,
+  };
+}
+
+function mergeCardCharacters(current: Character[], incoming: Character[]): Character[] {
+  const next = current.map((ch, i) => (incoming[i] ? copyRoleBody(ch, incoming[i]) : ch));
+  for (let i = current.length; i < incoming.length; i++) {
+    const src = incoming[i];
+    if (src) next.push({ ...src });
+  }
+  return next;
+}
+
+type Toast = { id: number; text: string };
+
+interface UI {
+  tab: TabId;
+  sidebar: boolean;
+  connection: boolean;
+  selectMode: boolean;
+  selected: string[];
+  sortMode: boolean;
+  menuId: string | null;
+  editingChatId: string | null;
+  creating: boolean;
+  previewParams: boolean;
+  saveCardOpen: boolean;
+  editCardId: string | null;
+  saveAppearOpen: boolean;
+  editAppearId: string | null;
+  appearTarget: "mid" | string | null;
+  customPrompt: {
+    chatId: string;
+    msgId: string;
+    imgId: string;
+    text: string;
+    charTails?: Record<string, string>;
+    wechatLineId?: string;
+  } | null;
+  confirm: { title: string; body: string; danger?: boolean; onOk: () => void } | null;
+  rename: { id: string; kind: "chat" | "folder" | "card" | "remark"; value: string } | null;
+  moveOpen: boolean;
+  multiCreate: string[] | null;
+  personalize: { mode: "create" | "edit"; text: string } | null;
+  fieldEdit: { key: string; charId?: string; text: string } | null;
+  polishJob: {
+    chatId: string;
+    kind: "personalize" | "field";
+    key?: string;
+    charId?: string;
+    instruction: string;
+  } | null;
+  extraPromptOpen: boolean;
+  autoPolish: boolean;
+  paramsJump: string | null;
+  llmSettings: boolean;
+  memoryHint: { chatId: string; state: "generating" | "ok" | "fail"; error?: string; draft?: string } | null;
+  editUserMsg: {
+    chatId: string;
+    msgId: string;
+    backup: string;
+    shotBackup: UserShot[] | null;
+  } | null;
+  wechatView: { chatId: string; msgId: string } | null;
+  workshop: boolean;
+  workshopName: "assistant" | "card" | null;
+  workshopEditId: string | null;
+  workshopAvatars: boolean;
+  workshopCardText: string | null;
+}
+
+interface State {
+  ready: boolean;
+  settings: Settings;
+  folders: Folder[];
+  chats: Chat[];
+  cards: CharacterCard[];
+  appearances: AppearancePreset[];
+  favorites: FavoriteItem[];
+  favGroups: FavGroup[];
+  history: HistoryItem[];
+  pureParams: ImageParams;
+  currentId: string | null;
+  editBackup: Chat | null;
+  toasts: Toast[];
+  ui: UI;
+  composerDrafts: Record<string, string>;
+  composerShots: Record<string, UserShot[]>;
+  wechatSessions: Record<string, WechatSession>;
+  wechatStickers: WechatSticker[];
+  hydrate: () => Promise<void>;
+  toast: (text: string) => void;
+  dismissToast: (id: number) => void;
+  setUI: (p: Partial<UI>) => void;
+  setSettings: (p: Partial<Settings>) => void;
+  setGrok: (id: GrokModelId) => void;
+  clearImageAi: () => void;
+  setTab: (t: TabId) => void;
+  current: () => Chat | undefined;
+  patchChat: (id: string, p: Partial<Chat> | ((c: Chat) => Chat)) => void;
+  patchParams: (id: string, p: Partial<ImageParams>) => void;
+  setPureParams: (p: Partial<ImageParams>) => void;
+  newDraft: () => void;
+  cancelDraft: () => void;
+  commitChat: (id: string) => void;
+  openChat: (id: string, opts?: { edit?: boolean }) => void;
+  beginEdit: (id: string) => void;
+  cancelEdit: () => void;
+  addFolder: (place?: "workshop") => void;
+  createWorkshop: (kind: "assistant" | "card", name: string) => void;
+  addCard: (card: CharacterCard) => void;
+  toggleFolder: (id: string) => void;
+  deleteSelected: () => void;
+  starSelected: () => void;
+  moveSelected: (folderId: string | null) => void;
+  copySelected: () => void;
+  renameItem: (id: string, name: string) => void;
+  reorder: (ids: string[]) => void;
+  saveCard: (chat: Chat, name: string) => void;
+  updateCard: (card: CharacterCard) => void;
+  applyCard: (chatId: string, card: CharacterCard, charIndex?: number) => void;
+  deleteCard: (id: string) => void;
+  reorderCards: (ids: string[]) => void;
+  saveAppearance: (name: string, prompt: string) => void;
+  updateAppearance: (id: string, name: string, prompt: string) => void;
+  applyAppearance: (chatId: string, preset: AppearancePreset, target: "mid" | string) => void;
+  deleteAppearance: (id: string) => void;
+  reorderAppearances: (ids: string[]) => void;
+  addFavorite: (blobId?: string) => void;
+  patchFavorite: (id: string, p: Partial<FavoriteItem>) => void;
+  deleteFavorite: (id: string) => void;
+  reorderFavorites: (ids: string[]) => void;
+  setFavOrders: (groupOrders: Record<string, number>, favOrders: Record<string, number>) => void;
+  addFavGroup: (name: string) => void;
+  renameFavGroup: (id: string, name: string) => void;
+  toggleFavGroup: (id: string) => void;
+  deleteFavGroup: (id: string) => void;
+  moveFavorite: (id: string, groupId: string | null) => void;
+  moveFavGroup: (id: string, parentId: string | null) => void;
+  toggleFavoriteStar: (id: string) => void;
+  toggleFavGroupStar: (id: string) => void;
+  setFavoriteThumb: (id: string, blobId: string) => void;
+  addHistory: (h: HistoryItem) => void;
+  patchHistory: (id: string, p: Partial<HistoryItem>) => void;
+  deleteHistory: (id: string) => void;
+  setCooldown: (until: number) => void;
+  setComposerDraft: (chatId: string, text: string) => void;
+  setComposerShot: (chatId: string, shots: UserShot[] | null) => void;
+  setWechatSession: (chatId: string, session: WechatSession | null) => void;
+  setWechatStickers: (items: WechatSticker[]) => void;
+}
+
+const ui0 = (): UI => ({
+  tab: "chat",
+  sidebar: false,
+  connection: false,
+  selectMode: false,
+  selected: [],
+  sortMode: false,
+  menuId: null,
+  editingChatId: null,
+  creating: false,
+  previewParams: false,
+  saveCardOpen: false,
+  editCardId: null,
+  saveAppearOpen: false,
+  editAppearId: null,
+  appearTarget: null,
+  customPrompt: null,
+  confirm: null,
+  rename: null,
+  moveOpen: false,
+  multiCreate: null,
+  personalize: null,
+  fieldEdit: null,
+  polishJob: null,
+  extraPromptOpen: false,
+  autoPolish: false,
+  paramsJump: null,
+  llmSettings: false,
+  memoryHint: null,
+  editUserMsg: null,
+  wechatView: null,
+  workshop: false,
+  workshopName: null,
+  workshopEditId: null,
+  workshopAvatars: false,
+  workshopCardText: null,
+});
+
+function persistChat(c: Chat) {
+  if (c.isDraft) return;
+  void db.chats.put(c);
+}
+
+let toastN = 1;
+
+export const useApp = create<State>((set, get) => ({
+  ready: true,
+  settings: defaultSettings(),
+  folders: [],
+  chats: [],
+  cards: [],
+  appearances: [],
+  favorites: [],
+  favGroups: [],
+  history: [],
+  pureParams: defaultPureParams(),
+  currentId: null,
+  editBackup: null,
+  toasts: [],
+  ui: ui0(),
+  composerDrafts: {},
+  composerShots: {},
+  wechatSessions: {},
+  wechatStickers: [],
+
+  hydrate: async () => {
+    const data = await loadAll();
+    const [pureRow, currentRow, draftsRow, shotsRow, wechatRow, stickerRow] = await Promise.all([
+      db.kv.get("pureParams"),
+      db.kv.get("currentId"),
+      db.kv.get("composerDrafts"),
+      db.kv.get("composerShots"),
+      db.kv.get("wechatSessions"),
+      db.kv.get("wechatStickers"),
+    ]);
+    const live = data.chats.filter((c) => !c.isDraft).map((c) => {
+      const mapped = {
+        ...normalizeChatMemory(c),
+        grokModelId: migrateGrokId(c.grokModelId),
+        imageModelId: dropBuiltinImageModel(c.imageModelId),
+        imageModelPin: dropBuiltinImageModel(c.imageModelPin),
+      };
+      const next = settleStuckImages(mapped);
+      const stripped = c.imageModelId !== mapped.imageModelId || (c.imageModelPin || null) !== mapped.imageModelPin;
+      if (next !== mapped || stripped) persistChat(next);
+      return next;
+    });
+    const settings: Settings = {
+      ...data.settings,
+      grokModelId: migrateGrokId(data.settings.grokModelId),
+      theme: data.settings.theme === "dark" ? "dark" : "light",
+      llmParams: data.settings.llmParams,
+      chatSource: "api",
+      imageModelId: dropBuiltinImageModel(data.settings.imageModelId),
+      imageModelPin: dropBuiltinImageModel(data.settings.imageModelPin),
+    };
+    const savedId = (currentRow?.value as string) || null;
+    const currentId = live.some((c) => c.id === savedId)
+      ? savedId
+      : live.sort((a, b) => b.updatedAt - a.updatedAt)[0]?.id ?? null;
+    const lifted = liftImageAi(settings, live, currentId);
+    const nextSettings = { ...settings, ...lifted };
+    const withRandom = syncAppearanceModule(nextSettings.random, data.appearances ?? [], "ensure");
+    const settingsFinal = withRandom === nextSettings.random ? nextSettings : { ...nextSettings, random: withRandom };
+    const liftDirty = !settings.imageModelId && !settings.imageModelPin && (lifted.imageModelId || lifted.imageModelPin);
+    if (liftDirty || settingsFinal !== nextSettings) {
+      void db.kv.put({ key: "settings", value: settingsFinal });
+    }
+    let chats = live;
+    let cards = data.cards ?? [];
+    let settingsOut = settingsFinal;
+    if (!settingsFinal.statusBarMigrated) {
+      chats = live.map((c) => {
+        if (!isLegacyStatusBar(c.statusBar)) return c;
+        const next = { ...c, statusBar: DEFAULT_STATUS_BAR };
+        persistChat(next);
+        return next;
+      });
+      cards = cards.map((card) => {
+        if (!isLegacyStatusBar(card.statusBar)) return card;
+        const next = { ...card, statusBar: DEFAULT_STATUS_BAR };
+        void db.cards.put(next);
+        return next;
+      });
+      settingsOut = { ...settingsFinal, statusBarMigrated: true };
+      void db.kv.put({ key: "settings", value: settingsOut });
+    }
+    const favs = orderFavorites((data.favorites ?? []).map(migrateFavorite).filter(Boolean) as FavoriteItem[]);
+    const tree = tidyFavTree(data.favGroups ?? [], favs);
+    set({
+      ready: true,
+      ...data,
+      settings: settingsOut,
+      chats,
+      cards,
+      favorites: tree.favorites,
+      favGroups: tree.favGroups,
+      pureParams: normalizePureParams((pureRow?.value as ImageParams) ?? defaultPureParams()),
+      currentId,
+      history: sortHistoryNewestFirst(data.history ?? []),
+      composerDrafts: parseComposerDrafts(draftsRow?.value),
+      composerShots: parseComposerShots(shotsRow?.value),
+      wechatSessions: parseWechatSessions(wechatRow?.value),
+      wechatStickers: parseStickers(stickerRow?.value),
+    });
+  },
+
+  toast: (text) => {
+    const id = toastN++;
+    set((s) => ({ toasts: [...s.toasts, { id, text }] }));
+  },
+
+  dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+
+  setUI: (p) => set((s) => ({ ui: { ...s.ui, ...p } })),
+  setTab: (tab) => set((s) => ({ ui: { ...s.ui, tab } })),
+
+  setSettings: (p) => {
+    const settings = { ...get().settings, ...p };
+    set({ settings });
+    void db.kv.put({ key: "settings", value: settings });
+  },
+
+  setGrok: (id) => {
+    get().setSettings({ grokModelId: id });
+    const cur = get().current();
+    if (cur) get().patchChat(cur.id, { grokModelId: id });
+  },
+
+  clearImageAi: () => {
+    get().setSettings({ imageModelId: null, imageModelPin: null });
+  },
+
+  current: () => get().chats.find((c) => c.id === get().currentId),
+
+  patchChat: (id, p) => {
+    set((s) => ({
+      chats: s.chats.map((c) => {
+        if (c.id !== id) return c;
+        const next = typeof p === "function" ? p(c) : { ...c, ...p, updatedAt: Date.now() };
+        persistChat(next);
+        return next;
+      }),
+    }));
+  },
+
+  patchParams: (id, p) => {
+    if (id === "__pure__") {
+      get().setPureParams(p);
+      return;
+    }
+    const chat = get().chats.find((c) => c.id === id);
+    if (!chat) return;
+    const imageParams = { ...chat.imageParams, ...p };
+    const bank = get().settings.random;
+    const random = bank ? forgetIfPrompt(bank, chat.imageParams, imageParams) : null;
+    get().patchChat(id, { imageParams });
+    if (random) get().setSettings({ random });
+  },
+
+  setPureParams: (p) => {
+    const prev = get().pureParams;
+    const pureParams = { ...prev, ...p };
+    set({ pureParams });
+    void db.kv.put({ key: "pureParams", value: pureParams });
+    const bank = get().settings.random;
+    if (!bank) return;
+    const random = forgetIfPrompt(bank, prev, pureParams);
+    if (random) get().setSettings({ random });
+  },
+
+  newDraft: () => {
+    const id = uid("chat_");
+    const grok = get().settings.grokModelId || DEFAULT_GROK;
+    const draft: Chat = {
+      id,
+      folderId: null,
+      name: "",
+      remark: "",
+      starred: false,
+      order: Date.now(),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      isDraft: true,
+      grokModelId: grok,
+      isMulti: false,
+      multiMode: "together",
+      promptMode: "insert",
+      adultBoost: false,
+      canGen: true,
+      statusBarOn: false,
+      statusBar: DEFAULT_STATUS_BAR,
+      overview: "",
+      opening: "",
+      extras: [],
+      memory: "",
+      memoryUntil: 0,
+      memoryFoldAt: 0,
+      memorySnaps: [],
+      characters: [emptyCharacter(1)],
+      imageParams: defaultImageParams(),
+      messages: [],
+      scrollTop: 0,
+    };
+    set((s) => ({
+      chats: [...s.chats, draft],
+      currentId: id,
+      ui: { ...s.ui, creating: true, editingChatId: null, sidebar: false, tab: "chat", menuId: null },
+    }));
+  },
+
+  cancelDraft: () => {
+    set((s) => {
+      const rest = s.chats.filter((c) => !c.isDraft);
+      return {
+        chats: rest,
+        currentId: rest.sort((a, b) => b.updatedAt - a.updatedAt)[0]?.id ?? null,
+        ui: { ...s.ui, creating: false, editingChatId: null },
+      };
+    });
+  },
+
+  commitChat: (id) => {
+    const c = get().chats.find((x) => x.id === id);
+    if (!c) return;
+    const name = c.characters.map((ch) => ch.name).filter(Boolean).join("、") || c.name || "未命名";
+    const appearance = c.characters[0]?.appearance || "";
+    const imageParams = syncCharsFromRole(c.imageParams, c.characters, c.isMulti);
+    if (!c.isMulti && !imageParams.promptMid.trim() && appearance) {
+      imageParams.promptMid = appearance;
+    }
+    const next: Chat = {
+      ...c,
+      name,
+      isDraft: false,
+      imageParams,
+      updatedAt: Date.now(),
+    };
+    persistChat(next);
+    void db.kv.put({ key: "currentId", value: id });
+    set((s) => ({
+      chats: s.chats.map((x) => (x.id === id ? next : x)),
+      currentId: id,
+      ui: { ...s.ui, creating: false, editingChatId: null, tab: "chat" },
+    }));
+  },
+
+  openChat: (id, opts) => {
+    void db.kv.put({ key: "currentId", value: id });
+    set((s) => ({
+      currentId: id,
+      ui: {
+        ...s.ui,
+        sidebar: false,
+        creating: false,
+        editingChatId: opts?.edit ? id : null,
+        tab: "chat",
+        menuId: null,
+      },
+    }));
+  },
+
+  beginEdit: (id) => {
+    const c = get().chats.find((x) => x.id === id);
+    set({
+      editBackup: c ? structuredClone(c) : null,
+      currentId: id,
+      ui: { ...get().ui, editingChatId: id, creating: false, sidebar: false, tab: "chat", menuId: null },
+    });
+  },
+
+  cancelEdit: () => {
+    const bak = get().editBackup;
+    if (bak) {
+      persistChat(bak);
+      set((s) => ({
+        chats: s.chats.map((c) => (c.id === bak.id ? bak : c)),
+        editBackup: null,
+        ui: { ...s.ui, editingChatId: null },
+      }));
+    } else {
+      set((s) => ({ ui: { ...s.ui, editingChatId: null }, editBackup: null }));
+    }
+  },
+
+  addFolder: (place) => {
+    const f: Folder = {
+      id: uid("fold_"),
+      name: "新建文件夹",
+      starred: false,
+      collapsed: false,
+      order: Date.now(),
+      createdAt: Date.now(),
+      ...(place === "workshop" ? { place: "workshop" as const } : {}),
+    };
+    void db.folders.put(f);
+    set((s) => ({ folders: [...s.folders, f] }));
+    get().toast("已创建文件夹");
+  },
+
+  createWorkshop: (kind, name) => {
+    const id = uid("chat_");
+    const settings = get().settings;
+    const avatar = kind === "card" ? settings.workshopCardAvatar : settings.workshopAssistAvatar;
+    const draft: Chat = {
+      id,
+      folderId: null,
+      name,
+      remark: "",
+      starred: false,
+      order: Date.now(),
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      kind,
+      brief: "",
+      grokModelId: settings.grokModelId || DEFAULT_GROK,
+      isMulti: false,
+      multiMode: "together",
+      promptMode: "insert",
+      adultBoost: false,
+      canGen: false,
+      statusBarOn: false,
+      statusBar: "",
+      overview: "",
+      opening: "",
+      extras: [],
+      memory: "",
+      memoryUntil: 0,
+      memoryFoldAt: 0,
+      memorySnaps: [],
+      characters: [{ ...emptyCharacter(1), name }],
+      imageParams: defaultImageParams(),
+      messages: [],
+      scrollTop: 0,
+      ...(avatar ? { customAvatarBlobId: avatar } : {}),
+    };
+    persistChat(draft);
+    set((s) => ({ chats: [...s.chats, draft] }));
+    get().toast(`已创建「${name}」`);
+  },
+
+  toggleFolder: (id) => {
+    set((s) => {
+      const folders = s.folders.map((f) => (f.id === id ? { ...f, collapsed: !f.collapsed } : f));
+      const f = folders.find((x) => x.id === id);
+      if (f) void db.folders.put(f);
+      return { folders };
+    });
+  },
+
+  deleteSelected: () => {
+    const ids = new Set(get().ui.selected);
+    const chats = get().chats.filter((c) => !ids.has(c.id));
+    const folders = get().folders.filter((f) => !ids.has(f.id));
+    const moved = chats.map((c) => (c.folderId && ids.has(c.folderId) ? { ...c, folderId: null } : c));
+    void db.chats.bulkPut(moved.filter((c) => !c.isDraft));
+    void db.chats.bulkDelete([...ids]);
+    void db.folders.bulkDelete([...ids]);
+    set((s) => {
+      const composerDrafts = dropDrafts(s.composerDrafts, ids);
+      const composerShots = dropShots(s.composerShots, ids);
+      const wechatSessions = dropWechat(s.wechatSessions, ids);
+      void db.kv.put({ key: "composerDrafts", value: composerDrafts });
+      void db.kv.put({ key: "composerShots", value: composerShots });
+      void db.kv.put({ key: "wechatSessions", value: wechatSessions });
+      return {
+        chats: moved,
+        folders,
+        currentId: ids.has(s.currentId || "") ? moved[0]?.id ?? null : s.currentId,
+        composerDrafts,
+        composerShots,
+        wechatSessions,
+        ui: { ...s.ui, selectMode: false, selected: [], sortMode: false, menuId: null },
+      };
+    });
+    get().toast("已删除");
+  },
+
+  starSelected: () => {
+    const ids = new Set(get().ui.selected);
+    const turningOn = get().chats.some((c) => ids.has(c.id) && !c.starred) || get().folders.some((f) => ids.has(f.id) && !f.starred);
+    set((s) => {
+      const chats = s.chats.map((c) => {
+        if (!ids.has(c.id)) return c;
+        const next = { ...c, starred: !c.starred, updatedAt: Date.now() };
+        persistChat(next);
+        return next;
+      });
+      const folders = s.folders.map((f) => {
+        if (!ids.has(f.id)) return f;
+        const next = { ...f, starred: !f.starred };
+        void db.folders.put(next);
+        return next;
+      });
+      return { chats, folders, ui: { ...s.ui, selectMode: false, selected: [] } };
+    });
+    get().toast(turningOn ? "已星标并置顶" : "已取消星标");
+  },
+
+  moveSelected: (folderId) => {
+    const ids = new Set(get().ui.selected);
+    set((s) => {
+      const chats = s.chats.map((c) => {
+        if (!ids.has(c.id)) return c;
+        const next = { ...c, folderId, updatedAt: Date.now() };
+        persistChat(next);
+        return next;
+      });
+      return { chats, ui: { ...s.ui, selectMode: false, selected: [], moveOpen: false } };
+    });
+    get().toast("已移动");
+  },
+
+  copySelected: () => {
+    const ids = get().ui.selected;
+    const extras: Chat[] = [];
+    for (const id of ids) {
+      const c = get().chats.find((x) => x.id === id);
+      if (!c) continue;
+      const copy = cloneChat(c);
+      extras.push(copy);
+      persistChat(copy);
+    }
+    set((s) => ({
+      chats: [...s.chats, ...extras],
+      ui: { ...s.ui, selectMode: false, selected: [] },
+    }));
+    get().toast(extras.length === 1 ? `已复制「${extras[0].name}」` : "已复制");
+  },
+
+  renameItem: (id, name) => {
+    set((s) => {
+      const chats = s.chats.map((c) => {
+        if (c.id !== id) return c;
+        const next = {
+          ...c,
+          name,
+          characters: c.isMulti
+            ? c.characters
+            : c.characters.map((ch, i) => (i === 0 ? { ...ch, name } : ch)),
+          updatedAt: Date.now(),
+        };
+        persistChat(next);
+        return next;
+      });
+      const folders = s.folders.map((f) => {
+        if (f.id !== id) return f;
+        const next = { ...f, name };
+        void db.folders.put(next);
+        return next;
+      });
+      const cards = s.cards.map((c) => {
+        if (c.id !== id) return c;
+        const next = { ...c, name };
+        void db.cards.put(next);
+        return next;
+      });
+      return { chats, folders, cards, ui: { ...s.ui, rename: null, selectMode: false, selected: [] } };
+    });
+    get().toast("已改名");
+  },
+
+  reorder: (ids) => {
+    const order = new Map(ids.map((id, i) => [id, i]));
+    set((s) => {
+      const chats = s.chats.map((c) => {
+        if (!order.has(c.id)) return c;
+        const next = { ...c, order: order.get(c.id)! };
+        persistChat(next);
+        return next;
+      });
+      const folders = s.folders.map((f) => {
+        if (!order.has(f.id)) return f;
+        const next = { ...f, order: order.get(f.id)! };
+        void db.folders.put(next);
+        return next;
+      });
+      return { chats, folders, ui: { ...s.ui, sortMode: false, selectMode: false, selected: [] } };
+    });
+  },
+
+  saveCard: (chat, name) => {
+    const card: CharacterCard = {
+      id: uid("card_"),
+      name,
+      isMulti: chat.isMulti,
+      overview: chat.overview,
+      opening: chat.opening,
+      extras: chat.extras,
+      statusBarOn: chat.statusBarOn,
+      statusBar: chat.statusBar,
+      characters: structuredClone(chat.characters),
+      grokModelId: chat.grokModelId,
+      customAvatarBlobId: chat.customAvatarBlobId || undefined,
+      createdAt: Date.now(),
+      order: Date.now(),
+    };
+    void db.cards.put(card);
+    set((s) => ({ cards: [...s.cards, card], ui: { ...s.ui, saveCardOpen: false } }));
+    get().toast(`已保存角色卡「${name}」`);
+  },
+
+  addCard: (card) => {
+    void db.cards.put(card);
+    set((s) => ({ cards: [...s.cards, card], ui: { ...s.ui, workshopCardText: null } }));
+    get().toast(`已保存角色卡「${card.name}」`);
+  },
+
+  updateCard: (card) => {
+    const prev = get().cards.find((c) => c.id === card.id);
+    if (!prev) {
+      get().toast("这张卡已经不在了");
+      return;
+    }
+    const next: CharacterCard = {
+      ...card,
+      id: prev.id,
+      name: card.name.trim() || prev.name,
+      createdAt: prev.createdAt,
+      order: prev.order,
+      customAvatarBlobId: card.customAvatarBlobId || undefined,
+    };
+    void db.cards.put(next);
+    set((s) => ({ cards: s.cards.map((c) => (c.id === next.id ? next : c)) }));
+    get().toast(`已保存角色卡「${next.name}」`);
+  },
+
+  applyCard: (chatId, card, charIndex) => {
+    get().patchChat(chatId, (c) => {
+      const oneSlot = c.isMulti && !card.isMulti && charIndex != null;
+      if (oneSlot) {
+        const src = card.characters[0];
+        const characters = src
+          ? c.characters.map((ch, i) => (i === charIndex ? copyRoleBody(ch, src) : ch))
+          : c.characters;
+        return {
+          ...c,
+          characters,
+          imageParams: syncCharsFromRole(c.imageParams, characters, c.isMulti),
+          updatedAt: Date.now(),
+        };
+      }
+      const characters = mergeCardCharacters(c.characters, card.characters);
+      return {
+        ...c,
+        isMulti: card.isMulti,
+        overview: card.overview,
+        opening: card.opening,
+        extras: card.extras,
+        statusBarOn: card.statusBarOn,
+        statusBar: card.statusBar,
+        grokModelId: card.grokModelId,
+        ...(card.customAvatarBlobId ? { customAvatarBlobId: card.customAvatarBlobId } : {}),
+        characters,
+        imageParams: syncCharsFromRole(c.imageParams, characters, card.isMulti),
+        updatedAt: Date.now(),
+      };
+    });
+    get().toast(`已应用「${card.name}」`);
+  },
+
+  deleteCard: (id) => {
+    void db.cards.delete(id);
+    const name = get().cards.find((c) => c.id === id)?.name ?? "";
+    set((s) => ({ cards: s.cards.filter((c) => c.id !== id) }));
+    get().toast(`已删除${name}`);
+  },
+
+  reorderCards: (ids) => {
+    const order = new Map(ids.map((id, i) => [id, i]));
+    set((s) => {
+      const cards = s.cards.map((c) => {
+        if (!order.has(c.id)) return c;
+        const next = { ...c, order: order.get(c.id)! };
+        void db.cards.put(next);
+        return next;
+      });
+      return { cards };
+    });
+  },
+
+  saveAppearance: (name, prompt) => {
+    const a: AppearancePreset = { id: uid("ap_"), name, prompt, order: Date.now(), createdAt: Date.now() };
+    void db.appearances.put(a);
+    const appearances = [...get().appearances, a];
+    set((s) => ({ appearances, ui: { ...s.ui, saveAppearOpen: false } }));
+    const random = syncAppearanceModule(get().settings.random, appearances, "create");
+    if (random !== get().settings.random) get().setSettings({ random });
+    get().toast(`已保存角色「${name}」`);
+  },
+
+  updateAppearance: (id, name, prompt) => {
+    const prev = get().appearances.find((a) => a.id === id);
+    if (!prev) {
+      get().toast("这个角色已经不在了");
+      return;
+    }
+    const next: AppearancePreset = { ...prev, name: name.trim() || prev.name, prompt };
+    void db.appearances.put(next);
+    const appearances = get().appearances.map((a) => (a.id === id ? next : a));
+    set({ appearances });
+    const random = syncAppearanceModule(get().settings.random, appearances, "update");
+    if (random !== get().settings.random) get().setSettings({ random });
+    get().toast(`已保存角色「${next.name}」`);
+  },
+
+  applyAppearance: (chatId, preset, target) => {
+    if (chatId === "__pure__") {
+      if (target === "mid") get().setPureParams({ promptMid: preset.prompt });
+      else {
+        get().setPureParams({
+          characters: get().pureParams.characters.map((ch) =>
+            ch.id === target ? { ...ch, prompt: preset.prompt } : ch,
+          ),
+        });
+      }
+      return;
+    }
+    get().patchChat(chatId, (c) => {
+      if (target === "mid") {
+        return {
+          ...c,
+          imageParams: { ...c.imageParams, promptMid: preset.prompt },
+          characters: c.isMulti
+            ? c.characters
+            : c.characters.map((ch, i) => (i === 0 ? { ...ch, appearance: preset.prompt } : ch)),
+        };
+      }
+      return {
+        ...c,
+        imageParams: {
+          ...c.imageParams,
+          characters: c.imageParams.characters.map((ch) =>
+            ch.id === target ? { ...ch, prompt: preset.prompt } : ch,
+          ),
+        },
+        characters: c.characters.map((ch) =>
+          ch.id === target ? { ...ch, appearance: preset.prompt, prompt: preset.prompt } : ch,
+        ),
+      };
+    });
+  },
+
+  deleteAppearance: (id) => {
+    void db.appearances.delete(id);
+    const appearances = get().appearances.filter((a) => a.id !== id);
+    set({ appearances });
+    const random = syncAppearanceModule(get().settings.random, appearances, "update");
+    if (random !== get().settings.random) get().setSettings({ random });
+  },
+
+  reorderAppearances: (ids) => {
+    const order = new Map(ids.map((id, i) => [id, i]));
+    const appearances = get().appearances.map((a) => {
+      if (!order.has(a.id)) return a;
+      const next = { ...a, order: order.get(a.id)! };
+      void db.appearances.put(next);
+      return next;
+    });
+    set({ appearances });
+    const random = syncAppearanceModule(get().settings.random, appearances, "update");
+    if (random !== get().settings.random) get().setSettings({ random });
+  },
+
+  addFavorite: (blobId) => {
+    const hist = blobId ? get().history.find((h) => h.blobId === blobId) : undefined;
+    const params = hist?.params
+      ? { ...structuredClone(hist.params), seed: hist.seed, seedLocked: true }
+      : (() => {
+          const p = structuredClone(get().pureParams);
+          if (p.seed != null) p.seedLocked = true;
+          return p;
+        })();
+    const list = get().favorites;
+    const loose = list.filter((f) => !f.groupId);
+    const top = loose.reduce((m, f) => Math.min(m, f.order ?? 0), 0);
+    const f: FavoriteItem = {
+      id: uid("fav_"),
+      name: presetNameFrom(params),
+      params,
+      blobId,
+      createdAt: Date.now(),
+      groupId: null,
+      starred: false,
+      order: loose.length ? top - 1 : 0,
+    };
+    void (async () => {
+      try {
+        await db.favorites.put(f);
+        set((s) => ({ favorites: sortFavorites([f, ...s.favorites]) }));
+        get().toast("已保存");
+      } catch (err) {
+        get().toast(err instanceof Error ? err.message : "收藏失败");
+      }
+    })();
+  },
+
+  patchFavorite: (id, p) => {
+    const row = get().favorites.find((f) => f.id === id);
+    if (!row) return;
+    const next = { ...row, ...p };
+    void (async () => {
+      try {
+        await db.favorites.put(next);
+        set((s) => ({
+          favorites: sortFavorites(s.favorites.map((f) => (f.id === id ? next : f))),
+        }));
+      } catch (err) {
+        get().toast(err instanceof Error ? err.message : "收藏更新失败");
+      }
+    })();
+  },
+
+  deleteFavorite: (id) => {
+    const row = get().favorites.find((f) => f.id === id);
+    set((s) => ({ favorites: s.favorites.filter((f) => f.id !== id) }));
+    void db.favorites.delete(id);
+    if (row?.blobId && !blobInUse(get(), row.blobId, id)) void deleteImage(row.blobId);
+    get().toast("已删除");
+  },
+
+  reorderFavorites: (ids) => {
+    const rank = new Map(ids.map((id, i) => [id, i]));
+    const next = sortFavorites(get().favorites.map((f) => (rank.has(f.id) ? { ...f, order: rank.get(f.id)! } : f)));
+    set({ favorites: next });
+    for (const f of next) void db.favorites.put(f);
+  },
+
+  setFavOrders: (groupOrders, favOrders) => {
+    set((s) => {
+      const favGroups = s.favGroups.map((g) => {
+        if (!(g.id in groupOrders) || groupOrders[g.id] === g.order) return g;
+        const next = { ...g, order: groupOrders[g.id] };
+        void db.favGroups.put(next);
+        return next;
+      });
+      const favorites = sortFavorites(
+        s.favorites.map((f) => {
+          if (!(f.id in favOrders) || favOrders[f.id] === (f.order ?? 0)) return f;
+          const next = { ...f, order: favOrders[f.id] };
+          void db.favorites.put(next);
+          return next;
+        }),
+      );
+      return { favGroups, favorites };
+    });
+  },
+
+  addFavGroup: (name) => {
+    const title = name.trim() || "未命名";
+    const roots = get().favGroups.filter((g) => !g.parentId);
+    const top = roots.reduce((m, g) => Math.min(m, g.order), 0);
+    const row: FavGroup = {
+      id: uid("fg_"),
+      name: title,
+      parentId: null,
+      collapsed: true,
+      order: roots.length ? top - 1 : 0,
+      starred: false,
+      createdAt: Date.now(),
+    };
+    void db.favGroups.put(row);
+    set((s) => ({ favGroups: [row, ...s.favGroups] }));
+  },
+
+  renameFavGroup: (id, name) => {
+    const row = get().favGroups.find((g) => g.id === id);
+    if (!row) return;
+    const next = { ...row, name: name.trim() || "未命名" };
+    void db.favGroups.put(next);
+    set((s) => ({ favGroups: s.favGroups.map((g) => (g.id === id ? next : g)) }));
+  },
+
+  toggleFavGroup: (id) => {
+    const row = get().favGroups.find((g) => g.id === id);
+    if (!row) return;
+    const next = { ...row, collapsed: !row.collapsed };
+    void db.favGroups.put(next);
+    set((s) => ({ favGroups: s.favGroups.map((g) => (g.id === id ? next : g)) }));
+  },
+
+  deleteFavGroup: (id) => {
+    const dropG = new Set<string>([id, ...favGroupDescendants(get().favGroups, id)]);
+    const dropF = get().favorites.filter((f) => f.groupId && dropG.has(f.groupId));
+    set((s) => ({
+      favGroups: s.favGroups.filter((g) => !dropG.has(g.id)),
+      favorites: s.favorites.filter((f) => !(f.groupId && dropG.has(f.groupId))),
+    }));
+    for (const gid of dropG) void db.favGroups.delete(gid);
+    for (const f of dropF) {
+      void db.favorites.delete(f.id);
+      if (f.blobId && !blobInUse(get(), f.blobId)) void deleteImage(f.blobId);
+    }
+    get().toast("已删除");
+  },
+
+  moveFavorite: (id, groupId) => {
+    const favs = get().favorites;
+    const row = favs.find((f) => f.id === id);
+    if (!row) return;
+    if (groupId && !get().favGroups.some((g) => g.id === groupId)) return;
+    const sib = favs.filter((f) => f.id !== id && (f.groupId ?? null) === groupId);
+    const top = sib.reduce((m, f) => Math.min(m, f.order ?? 0), 0);
+    const groups = openFavAncestors(get().favGroups, groupId);
+    if (groups !== get().favGroups) {
+      set({ favGroups: groups });
+      for (const g of groups) if (!g.collapsed) void db.favGroups.put(g);
+    }
+    get().patchFavorite(id, { groupId, order: sib.length ? top - 1 : 0 });
+  },
+
+  moveFavGroup: (id, parentId) => {
+    const groups = get().favGroups;
+    const row = groups.find((g) => g.id === id);
+    if (!row) return;
+    if (parentId) {
+      if (parentId === id || favGroupDescendants(groups, id).has(parentId)) return;
+      if (!groups.some((g) => g.id === parentId)) return;
+    }
+    const sib = groups.filter((g) => g.id !== id && (g.parentId ?? null) === parentId);
+    const top = sib.reduce((m, g) => Math.min(m, g.order), 0);
+    const moved = { ...row, parentId, order: sib.length ? top - 1 : 0 };
+    const next = openFavAncestors(
+      groups.map((g) => (g.id === id ? moved : g)),
+      parentId,
+    );
+    set({ favGroups: next });
+    for (const g of next) void db.favGroups.put(g);
+  },
+
+  toggleFavoriteStar: (id) => {
+    const row = get().favorites.find((f) => f.id === id);
+    if (!row) return;
+    const next = { ...row, starred: !row.starred };
+    void db.favorites.put(next);
+    set((s) => ({ favorites: s.favorites.map((f) => (f.id === id ? next : f)) }));
+  },
+
+  toggleFavGroupStar: (id) => {
+    const row = get().favGroups.find((g) => g.id === id);
+    if (!row) return;
+    const next = { ...row, starred: !row.starred };
+    void db.favGroups.put(next);
+    set((s) => ({ favGroups: s.favGroups.map((g) => (g.id === id ? next : g)) }));
+  },
+
+  setFavoriteThumb: (id, blobId) => {
+    const row = get().favorites.find((f) => f.id === id);
+    const old = row?.blobId;
+    get().patchFavorite(id, { blobId });
+    if (old && old !== blobId && !blobInUse(get(), old, id)) void deleteImage(old);
+    get().toast("已更新配图");
+  },
+
+  addHistory: (h) => {
+    void db.history.put(h);
+    set((s) => ({ history: sortHistoryNewestFirst([h, ...s.history]).slice(0, 200) }));
+  },
+
+  patchHistory: (id, p) => {
+    set((s) => {
+      const history = s.history.map((h) => (h.id === id ? { ...h, ...p } : h));
+      const row = history.find((h) => h.id === id);
+      if (row) void db.history.put(row);
+      return { history };
+    });
+  },
+
+  deleteHistory: (id) => {
+    const row = get().history.find((h) => h.id === id);
+    set((s) => ({ history: s.history.filter((h) => h.id !== id) }));
+    void db.history.delete(id);
+    if (row?.blobId && !blobInUse(get(), row.blobId)) void deleteImage(row.blobId);
+  },
+
+  setCooldown: (until) => get().setSettings({ cooldownUntil: until }),
+
+  setComposerDraft: (chatId, text) => {
+    set((s) => {
+      const composerDrafts = { ...s.composerDrafts };
+      if (text) composerDrafts[chatId] = text;
+      else delete composerDrafts[chatId];
+      void db.kv.put({ key: "composerDrafts", value: composerDrafts });
+      return { composerDrafts };
+    });
+  },
+
+  setComposerShot: (chatId, shots) => {
+    set((s) => {
+      const composerShots = { ...s.composerShots };
+      if (shots?.length) composerShots[chatId] = shots;
+      else delete composerShots[chatId];
+      void db.kv.put({ key: "composerShots", value: composerShots });
+      return { composerShots };
+    });
+  },
+
+  setWechatSession: (chatId, session) => {
+    set((s) => {
+      const wechatSessions = { ...s.wechatSessions };
+      if (session) wechatSessions[chatId] = session;
+      else delete wechatSessions[chatId];
+      void db.kv.put({ key: "wechatSessions", value: wechatSessions });
+      return { wechatSessions };
+    });
+  },
+
+  setWechatStickers: (items) => {
+    set({ wechatStickers: items });
+    void db.kv.put({ key: "wechatStickers", value: items });
+  },
+}));
+
+bindSysApp(() => useApp);
+
+function parseComposerDrafts(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (k && typeof v === "string" && v) out[k] = v;
+  }
+  return out;
+}
+
+function dropDrafts(drafts: Record<string, string>, ids: Set<string>) {
+  const next = { ...drafts };
+  for (const id of ids) delete next[id];
+  return next;
+}
+
+function parseOneShot(v: unknown): UserShot | null {
+  if (!v || typeof v !== "object") return null;
+  const row = v as { blobId?: unknown; i2i?: unknown };
+  if (typeof row.blobId !== "string" || !row.blobId) return null;
+  return { blobId: row.blobId, i2i: row.i2i === true };
+}
+
+function parseComposerShots(raw: unknown): Record<string, UserShot[]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, UserShot[]> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!k) continue;
+    const rows = Array.isArray(v) ? v.map(parseOneShot) : [parseOneShot(v)];
+    let lit = false;
+    const shots = rows.filter((s): s is UserShot => !!s).map((s) => {
+      const i2i = s.i2i && !lit;
+      if (i2i) lit = true;
+      return { blobId: s.blobId, i2i };
+    });
+    if (shots.length) out[k] = shots;
+  }
+  return out;
+}
+
+function dropShots(shots: Record<string, UserShot[]>, ids: Set<string>) {
+  const next = { ...shots };
+  for (const id of ids) delete next[id];
+  return next;
+}
+
+function parseStickers(raw: unknown): WechatSticker[] {
+  if (!Array.isArray(raw)) return [];
+  const out: WechatSticker[] = [];
+  for (const item of raw) {
+    if (typeof item === "string" && item) {
+      out.push({ blobId: item, brief: "" });
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const blobId = (item as { blobId?: unknown }).blobId;
+    const brief = (item as { brief?: unknown }).brief;
+    if (typeof blobId === "string" && blobId) out.push({ blobId, brief: typeof brief === "string" ? brief : "" });
+  }
+  return out;
+}
+
+function parseWechatRooms(raw: unknown): Record<string, import("./types").WechatRoom> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, import("./types").WechatRoom> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!k || !v || typeof v !== "object") continue;
+    const row = v as Partial<import("./types").WechatRoom>;
+    out[k] = {
+      lines: Array.isArray(row.lines) ? row.lines : [],
+      earlier: typeof row.earlier === "string" ? row.earlier : "",
+      folded: typeof row.folded === "number" && row.folded > 0 ? Math.floor(row.folded) : 0,
+      draft: typeof row.draft === "string" ? row.draft : "",
+      pending: Array.isArray(row.pending) ? row.pending : [],
+    };
+  }
+  return out;
+}
+
+function parseWechatSessions(raw: unknown): Record<string, WechatSession> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, WechatSession> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (!k || !v || typeof v !== "object") continue;
+    const row = v as Partial<WechatSession>;
+    out[k] = {
+      charId: typeof row.charId === "string" ? row.charId : "",
+      lines: Array.isArray(row.lines) ? row.lines : [],
+      earlier: typeof row.earlier === "string" ? row.earlier : "",
+      folded: typeof row.folded === "number" && row.folded > 0 ? Math.floor(row.folded) : 0,
+      draft: typeof row.draft === "string" ? row.draft : "",
+      pending: Array.isArray(row.pending) ? row.pending : [],
+      armed: row.armed === true,
+      minimized: row.minimized === true,
+      ...(typeof row.activeRoom === "string" ? { activeRoom: row.activeRoom } : {}),
+      ...(row.rooms && typeof row.rooms === "object" ? { rooms: parseWechatRooms(row.rooms) } : {}),
+    };
+  }
+  return out;
+}
+
+function dropWechat(sessions: Record<string, WechatSession>, ids: Set<string>) {
+  const next = { ...sessions };
+  for (const id of ids) delete next[id];
+  return next;
+}
+
+function liftImageAi(
+  settings: Settings,
+  chats: Chat[],
+  currentId: string | null,
+): { imageModelId: string | null; imageModelPin: string | null } {
+  if (settings.imageModelId || settings.imageModelPin) {
+    return {
+      imageModelId: settings.imageModelId ?? null,
+      imageModelPin: settings.imageModelPin ?? null,
+    };
+  }
+  const cur = chats.find((c) => c.id === currentId);
+  const hit = [cur, ...chats].find((c) => c && (c.imageModelId || c.imageModelPin));
+  return {
+    imageModelId: hit?.imageModelId ?? null,
+    imageModelPin: hit?.imageModelPin ?? null,
+  };
+}
+
+function blobInUse(s: State, blobId: string, skipFav?: string) {
+  if (s.favorites.some((f) => f.blobId === blobId && f.id !== skipFav)) return true;
+  if (s.favorites.some((f) => f.params.img2imgBlobId === blobId)) return true;
+  if (s.pureParams.img2imgBlobId === blobId) return true;
+  if (s.history.some((h) => h.blobId === blobId)) return true;
+  if (s.cards.some((card) => card.customAvatarBlobId === blobId || card.characters.some((c) => c.lookBlobId === blobId || c.wechatAvatarBlobId === blobId))) return true;
+  if (s.wechatStickers.some((st) => st.blobId === blobId)) return true;
+  for (const c of s.chats) {
+    if (c.avatarBlobId === blobId) return true;
+    if (c.customAvatarBlobId === blobId) return true;
+    if (c.imageParams.img2imgBlobId === blobId) return true;
+    if (c.characters.some((ch) => ch.lookBlobId === blobId || ch.wechatAvatarBlobId === blobId)) return true;
+    for (const m of c.messages) {
+      if (m.userImageBlobId === blobId) return true;
+      if (m.userImages?.some((s) => s.blobId === blobId)) return true;
+      if (m.images.some((g) => g.blobId === blobId)) return true;
+    }
+  }
+  return false;
+}
+
+export async function saveBlob(blob: Blob) {
+  const id = uid("img_");
+  await putImage(id, blob);
+  rememberUrl(id, blob);
+  return id;
+}
+
+export function listedChats(folders: Folder[], chats: Chat[], place: "home" | "workshop" = "home") {
+  const live = chats.filter((c) => !c.isDraft && (place === "workshop" ? isWorkshopChat(c) : !isWorkshopChat(c)));
+  const foldersSorted = [...folders]
+    .filter((f) => (place === "workshop" ? f.place === "workshop" : f.place !== "workshop"))
+    .sort((a, b) => {
+      if (a.starred !== b.starred) return a.starred ? -1 : 1;
+      return a.order - b.order;
+    });
+  const root = live
+    .filter((c) => !c.folderId)
+    .sort((a, b) => {
+      if (a.starred !== b.starred) return a.starred ? -1 : 1;
+      return a.order - b.order;
+    });
+  return {
+    foldersSorted,
+    root,
+    inFolder: (fid: string) =>
+      live
+        .filter((c) => c.folderId === fid)
+        .sort((a, b) => {
+          if (a.starred !== b.starred) return a.starred ? -1 : 1;
+          return a.order - b.order;
+        }),
+  };
+}
+
+export function fakePureChat(params: ImageParams, grokModelId: GrokModelId): Chat {
+  return {
+    id: "__pure__",
+    folderId: null,
+    name: "纯生图",
+    remark: "",
+    starred: false,
+    order: -1,
+    createdAt: 0,
+    updatedAt: 0,
+    isDraft: true,
+    grokModelId,
+    isMulti: false,
+    multiMode: "together",
+    promptMode: "insert",
+    adultBoost: false,
+    canGen: true,
+    statusBarOn: false,
+    statusBar: "",
+    overview: "",
+    opening: "",
+    extras: [],
+    memory: "",
+    memoryUntil: 0,
+    memoryFoldAt: 0,
+    memorySnaps: [],
+    characters: [],
+    imageParams: params,
+    messages: [],
+    scrollTop: 0,
+  };
+}

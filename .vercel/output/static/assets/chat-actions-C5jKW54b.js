@@ -1,0 +1,1 @@
+export{p as sendOpening}from"./routes-B4xxZ6ij.js";

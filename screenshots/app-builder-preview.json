@@ -1,0 +1,36 @@
+{
+  "url": "http://127.0.0.1:8080/",
+  "viewports": {
+    "desktop": {
+      "width": 1280,
+      "height": 800,
+      "status": 200,
+      "title": "绘语",
+      "hasCanvas": false,
+      "bodyTextLen": 54,
+      "bodyTextHash": "be1074a205ee4247755c1255ae6fa74cc6c0de8a24d47caaf99edad387bb7036",
+      "bodyTextPrefix": "聊天 生图参数 纯生图 还没有开始 点左上角打开侧栏，新建一个角色就能聊。配图会跟着每句回复出来。 新建聊天",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview.png"
+    },
+    "mobile": {
+      "width": 390,
+      "height": 844,
+      "status": 200,
+      "title": "绘语",
+      "hasCanvas": false,
+      "bodyTextLen": 54,
+      "bodyTextHash": "be1074a205ee4247755c1255ae6fa74cc6c0de8a24d47caaf99edad387bb7036",
+      "bodyTextPrefix": "聊天 生图参数 纯生图 还没有开始 点左上角打开侧栏，新建一个角色就能聊。配图会跟着每句回复出来。 新建聊天",
+      "horizontalOverflow": false,
+      "consoleErrors": [],
+      "pageErrors": [],
+      "screenshot": "/workspace/screenshots/app-builder-preview-mobile.png"
+    }
+  },
+  "brandWarnings": [],
+  "authWarnings": [],
+  "verdictFile": "/workspace/screenshots/app-builder-preview.json"
+}

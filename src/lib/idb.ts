@@ -1,0 +1,240 @@
+import Dexie, { type Table } from "dexie";
+import type {
+  AppearancePreset,
+  CharacterCard,
+  Chat,
+  FavoriteItem,
+  FavGroup,
+  Folder,
+  HistoryItem,
+  LlmAccount,
+  Settings,
+  SysPromptPatch,
+} from "./types";
+import { DEFAULT_GROK, DEFAULT_LLM_PARAMS, DEFAULT_NAI_BASE, migrateGrokId, mergeLlmParams } from "./constants";
+import { parseStPresets } from "./st-preset";
+import { parseRandomBank } from "./random-prompt";
+import { llmIdentity, dropBuiltinImageModel } from "./image-ai";
+
+export const defaultSettings = (): Settings => ({
+  grokModelId: DEFAULT_GROK,
+  chatSource: "api",
+  llmBase: "",
+  llmKey: "",
+  llmConnected: false,
+  llmModel: "",
+  llmModels: [],
+  llmStarred: [],
+  llmAccounts: [],
+  llmParams: { ...DEFAULT_LLM_PARAMS },
+  llmIdentity: "",
+  stPresets: [],
+  stActiveId: null,
+  stParamSnapshot: null,
+  stImageActiveId: null,
+  stWechatActiveId: null,
+  stPresetId: null,
+  stUseChat: false,
+  stUseImage: false,
+  stUseWechat: false,
+  stPresetMode: "new",
+  naiKey: "",
+  naiBase: DEFAULT_NAI_BASE,
+  naiConnected: false,
+  naiImageSource: "proxy",
+  naiOfficialKey: "",
+  naiOfficialConnected: false,
+  cooldownUntil: 0,
+  chatImage: true,
+  imageModelId: null,
+  imageModelPin: null,
+  theme: "light",
+  multiDrawCount: 1,
+  multiDrawInfinite: false,
+  multiDrawExact: 1,
+  multiDrawExactOn: false,
+  random: { enabled: false, modules: [], comboLast: {} },
+});
+
+class HuiyuDB extends Dexie {
+  chats!: Table<Chat, string>;
+  folders!: Table<Folder, string>;
+  cards!: Table<CharacterCard, string>;
+  appearances!: Table<AppearancePreset, string>;
+  favorites!: Table<FavoriteItem, string>;
+  favGroups!: Table<FavGroup, string>;
+  history!: Table<HistoryItem, string>;
+  images!: Table<{ id: string; blob: Blob }, string>;
+  kv!: Table<{ key: string; value: unknown }, string>;
+
+  constructor() {
+    super("huiyu");
+    this.version(1).stores({
+      chats: "id, folderId, order, updatedAt",
+      folders: "id, order",
+      cards: "id, order",
+      appearances: "id, order",
+      favorites: "id, createdAt",
+      history: "id, createdAt",
+      images: "id",
+      kv: "key",
+    });
+    this.version(2).stores({
+      favGroups: "id, parentId, order",
+    });
+  }
+}
+
+export const db = new HuiyuDB();
+
+function parseLlmAccounts(raw: unknown): LlmAccount[] {
+  if (!Array.isArray(raw)) return [];
+  const out: LlmAccount[] = [];
+  for (const row of raw) {
+    if (!row || typeof row !== "object") continue;
+    const a = row as Partial<LlmAccount>;
+    if (typeof a.id !== "string" || typeof a.name !== "string") continue;
+    out.push({
+      id: a.id,
+      name: a.name,
+      base: typeof a.base === "string" ? a.base : "",
+      key: typeof a.key === "string" ? a.key : "",
+      starred: Array.isArray(a.starred) ? a.starred.filter((id): id is string => typeof id === "string") : undefined,
+      model: typeof a.model === "string" ? a.model : undefined,
+    });
+  }
+  return out;
+}
+
+function parseSysPrompt(raw: unknown): Record<string, SysPromptPatch> | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const out: Record<string, SysPromptPatch> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (!value || typeof value !== "object") continue;
+    const row = value as { text?: unknown; force?: unknown; off?: unknown };
+    const patch: SysPromptPatch = {};
+    if (typeof row.text === "string") patch.text = row.text;
+    if (typeof row.force === "boolean") patch.force = row.force;
+    if (row.off === true) patch.off = true;
+    if (patch.text !== undefined || patch.force !== undefined || patch.off) out[key] = patch;
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+function exactDrawCount(raw: unknown) {
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(n, Number.MAX_SAFE_INTEGER);
+}
+
+export async function loadAll() {
+  const [chats, folders, cards, appearances, favorites, favGroups, history, settingsRow] = await Promise.all([
+    db.chats.toArray(),
+    db.folders.toArray(),
+    db.cards.toArray(),
+    db.appearances.toArray(),
+    db.favorites.toArray(),
+    db.favGroups.toArray(),
+    db.history.toArray(),
+    db.kv.get("settings"),
+  ]);
+  const raw = (settingsRow?.value as Settings | undefined) ?? undefined;
+  const stPresets = parseStPresets(raw?.stPresets);
+  const stActiveId =
+    typeof raw?.stActiveId === "string" && stPresets.some((p) => p.id === raw.stActiveId) ? raw.stActiveId : null;
+  const stImageActiveId =
+    typeof raw?.stImageActiveId === "string" && stPresets.some((p) => p.id === raw.stImageActiveId)
+      ? raw.stImageActiveId
+      : null;
+  const stWechatActiveId =
+    typeof raw?.stWechatActiveId === "string" && stPresets.some((p) => p.id === raw.stWechatActiveId)
+      ? raw.stWechatActiveId
+      : null;
+  const picked =
+    (typeof raw?.stPresetId === "string" && stPresets.some((p) => p.id === raw.stPresetId) ? raw.stPresetId : null) ||
+    stActiveId ||
+    stWechatActiveId ||
+    stImageActiveId;
+  const stUseChat = typeof raw?.stUseChat === "boolean" ? raw.stUseChat : Boolean(stActiveId);
+  const stUseImage = typeof raw?.stUseImage === "boolean" ? raw.stUseImage : Boolean(stImageActiveId);
+  const stUseWechat = typeof raw?.stUseWechat === "boolean" ? raw.stUseWechat : Boolean(stWechatActiveId);
+  const stPresetId = picked;
+  const settings: Settings = {
+    ...defaultSettings(),
+    ...(raw ?? {}),
+    grokModelId: migrateGrokId(raw?.grokModelId),
+    llmParams: mergeLlmParams(raw?.llmParams),
+    llmModels: raw?.llmModels ?? [],
+    llmStarred: raw?.llmStarred ?? [],
+    llmAccounts: parseLlmAccounts(raw?.llmAccounts),
+    stPresets,
+    stActiveId: stUseChat ? stPresetId : null,
+    stParamSnapshot:
+      (stUseChat || stUseImage || stUseWechat) && raw?.stParamSnapshot ? mergeLlmParams(raw.stParamSnapshot) : null,
+    stImageActiveId: stUseImage ? stPresetId : null,
+    stWechatActiveId: stUseWechat ? stPresetId : null,
+    stPresetId,
+    stUseChat,
+    stUseImage,
+    stUseWechat,
+    stPresetMode: raw?.stPresetMode === "old" ? "old" : "new",
+    naiImageSource: raw?.naiImageSource === "official" ? "official" : "proxy",
+    naiOfficialKey: typeof raw?.naiOfficialKey === "string" ? raw.naiOfficialKey : "",
+    naiOfficialConnected: raw?.naiOfficialConnected === true,
+    chatSource: "api",
+    chatImage: raw?.chatImage !== false,
+    imageModelId: dropBuiltinImageModel(typeof raw?.imageModelId === "string" ? raw.imageModelId : null),
+    imageModelPin: dropBuiltinImageModel(typeof raw?.imageModelPin === "string" ? raw.imageModelPin : null),
+    multiDrawCount: Math.min(10, Math.max(1, Math.round(Number(raw?.multiDrawCount) || 1))),
+    multiDrawInfinite: raw?.multiDrawInfinite === true && raw?.multiDrawExactOn !== true,
+    multiDrawExact: exactDrawCount(raw?.multiDrawExact),
+    multiDrawExactOn: raw?.multiDrawExactOn === true && raw?.multiDrawInfinite !== true,
+    random: parseRandomBank(raw?.random),
+    sysPrompt: parseSysPrompt(raw?.sysPrompt),
+    llmIdentity:
+      typeof raw?.llmIdentity === "string" && raw.llmIdentity
+        ? raw.llmIdentity
+        : raw?.llmConnected && raw?.llmBase && raw?.llmKey
+          ? llmIdentity(String(raw.llmBase), String(raw.llmKey))
+          : "",
+  };
+  return { chats, folders, cards, appearances, favorites, favGroups, history, settings };
+}
+
+export async function putImage(id: string, blob: Blob) {
+  await db.images.put({ id, blob });
+}
+
+export async function getImage(id: string) {
+  const row = await db.images.get(id);
+  return row?.blob ?? null;
+}
+
+export async function deleteImage(id: string) {
+  await db.images.delete(id);
+}
+
+const urlCache = new Map<string, string>();
+
+export async function imageUrl(id: string | undefined | null): Promise<string | null> {
+  if (!id) return null;
+  const cached = urlCache.get(id);
+  if (cached) return cached;
+  const blob = await getImage(id);
+  if (!blob) return null;
+  const url = URL.createObjectURL(blob);
+  urlCache.set(id, url);
+  return url;
+}
+
+export function rememberUrl(id: string, blob: Blob) {
+  const prev = urlCache.get(id);
+  if (prev) URL.revokeObjectURL(prev);
+  const url = URL.createObjectURL(blob);
+  urlCache.set(id, url);
+  return url;
+}
+
+export function cachedUrl(id?: string | null) {
+  return id ? urlCache.get(id) ?? null : null;
+}
